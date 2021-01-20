@@ -42,7 +42,7 @@ static DEFINE_IDR(zram_index_idr);
 static DEFINE_MUTEX(zram_index_mutex);
 
 static int zram_major;
-static const char *default_compressor = "lzo-rle";
+static const char *default_compressor = CONFIG_ZRAM_DEFAULT_COMPRESSOR;
 
 #define BACKEND_PAR_BUF_SIZE	32
 static char backend_par_buf[BACKEND_PAR_BUF_SIZE];
@@ -1153,7 +1153,7 @@ static bool zram_meta_alloc(struct zram *zram, u64 disksize)
 	if (!zram->table)
 		return false;
 
-	backend = strlen(backend_par_buf) ? backend_par_buf : "zsmalloc";
+	backend = strlen(backend_par_buf) ? backend_par_buf : CONFIG_ZRAM_DEFAULT_BACKEND;
 	zram->mem_pool = zpool_create_pool(backend, zram->disk->disk_name,
 					GFP_NOIO, NULL);
 	if (!zram->mem_pool) {
