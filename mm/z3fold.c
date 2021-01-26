@@ -148,6 +148,7 @@ struct z3fold_header {
  * @release_wq:	workqueue for safe page release
  * @work:	work_struct for safe page release
  * @inode:	inode for z3fold pseudo filesystem
+ * @compacted_nr: number of z3fold pages that are compacted
  *
  * This structure is allocated at pool creation time and maintains metadata
  * pertaining to a particular z3fold pool.
@@ -168,6 +169,7 @@ struct z3fold_pool {
 	struct workqueue_struct *release_wq;
 	struct work_struct work;
 	struct inode *inode;
+	atomic_t compacted_nr;
 };
 
 /*
@@ -1549,6 +1551,84 @@ static void z3fold_unmap(struct z3fold_pool *pool, unsigned long handle)
 }
 
 /**
+ * z3fold_compact() - try to run compaction over the z3fold pool
+ * @pool:       pool in which the allocation resides
+ *
+ * Returns: the number of migrated pages
+ */
+static unsigned long z3fold_compact(struct z3fold_pool *pool)
+{
+	struct list_head *p;
+	struct z3fold_header *zhdr = NULL;
+	struct page *page = NULL;
+	int compacted = 0, failed = 0, max_num_failed = 100;
+
+	do {
+		spin_lock(&pool->lock);
+		list_for_each(p, &pool->lru) {
+			page = list_entry(p, struct page, lru);
+			if (test_bit(PAGE_HEADLESS, &page->private) ||
+			    unlikely(PageIsolated(page)))
+				continue;
+
+			zhdr = page_address(page);
+			if (!z3fold_page_trylock(zhdr)) {
+				zhdr = NULL;
+				continue;
+			}
+
+			if (!buddy_single(zhdr) ||
+			    test_bit(NEEDS_COMPACTING, &page->private) ||
+			    test_bit(PAGE_STALE, &page->private) ||
+			    zhdr->mapped_count != 0 ||
+			    zhdr->foreign_handles != 0) {
+				z3fold_page_unlock(zhdr);
+				zhdr = NULL;
+				continue;
+			}
+
+			if (!list_empty(&zhdr->buddy))
+				list_del_init(&zhdr->buddy);
+			list_del_init(&page->lru);
+			break;
+		}
+		spin_unlock(&pool->lock);
+		if (!zhdr)
+			break;
+
+		if (compact_single_buddy(zhdr)) {
+			compacted++;
+			if (kref_put(&zhdr->refcount,
+				     release_z3fold_page_locked)) {
+				atomic64_dec(&pool->pages_nr);
+				continue;
+			}
+		} else {
+			failed++;
+		}
+		spin_lock(&pool->lock);
+		list_add_tail(&page->lru, &pool->lru);
+		spin_unlock(&pool->lock);
+		add_to_unbuddied(pool, zhdr);
+		z3fold_page_unlock(zhdr);
+	} while (failed < max_num_failed);
+
+	atomic_add(compacted, &pool->compacted_nr);
+	return atomic_read(&pool->compacted_nr);
+}
+
+/**
+ * z3fold_get_num_compacted() - get the number of migrated/compacted pages
+ * @pool:       pool to get compaction statistic for
+ *
+ * Returns: the total number of migrated pages for the pool
+ */
+static unsigned long z3fold_get_num_compacted(struct z3fold_pool *pool)
+{
+	return atomic_read(&pool->compacted_nr);
+}
+
+/**
  * z3fold_get_pool_size() - gets the z3fold pool size in pages
  * @pool:	pool whose size is being queried
  *
@@ -1768,9 +1848,23 @@ static void z3fold_zpool_unmap(void *pool, unsigned long handle)
 	z3fold_unmap(pool, handle);
 }
 
+static unsigned long z3fold_zpool_compact(void *pool)
+{
+	return z3fold_compact(pool);
+}
+static unsigned long z3fold_zpool_get_compacted(void *pool)
+{
+	return z3fold_get_num_compacted(pool);
+}
+
 static u64 z3fold_zpool_total_size(void *pool)
 {
 	return z3fold_get_pool_size(pool) * PAGE_SIZE;
+}
+
+static size_t z3fold_zpool_huge_class_size(void *pool)
+{
+	return PAGE_SIZE - ZHDR_SIZE_ALIGNED;
 }
 
 static struct zpool_driver z3fold_zpool_driver = {
@@ -1783,7 +1877,10 @@ static struct zpool_driver z3fold_zpool_driver = {
 	.shrink =	z3fold_zpool_shrink,
 	.map =		z3fold_zpool_map,
 	.unmap =	z3fold_zpool_unmap,
+	.compact =	z3fold_zpool_compact,
+	.get_num_compacted = z3fold_zpool_get_compacted,
 	.total_size =	z3fold_zpool_total_size,
+	.huge_class_size = z3fold_zpool_huge_class_size,
 };
 
 MODULE_ALIAS("zpool-z3fold");
